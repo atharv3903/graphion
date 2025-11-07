@@ -1,0 +1,23 @@
+# Binaries
+*.exe
+*.out
+*.dll
+
+# Build folders
+bin/
+dist/
+
+# Logs
+*.log
+
+# IDE stuff
+.vscode/
+.idea/
+
+# Temp
+tmp/
+*.tmp
+
+# OS files
+Thumbs.db
+.DS_Store
