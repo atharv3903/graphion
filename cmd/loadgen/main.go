@@ -1,318 +1,180 @@
 package main
 
 import (
-	"bytes"
+	"context"
 	"database/sql"
-	"encoding/csv"
 	"encoding/json"
-	"flag"
 	"fmt"
-	"io"
+	"log"
 	"math/rand"
 	"net/http"
 	"os"
-	"sort"
-	"sync"
 	"time"
 
 	_ "github.com/go-sql-driver/mysql"
 )
 
-var httpClient *http.Client
-
-type EdgePair struct {
-	Src int64
-	Dst int64
+type RouteResp struct {
+	Path          []int64 `json:"path"`
+	Total         int     `json:"total"`
+	ExploredNodes int     `json:"explored_nodes"`
+	CacheHit      bool    `json:"cache_hit"`
 }
 
-func fetchEdgePairs(dsn string) ([]EdgePair, error) {
-	db, err := sql.Open("mysql", dsn)
-	if err != nil {
-		return nil, err
-	}
-	defer db.Close()
-
-	rows, err := db.Query("SELECT src_node, dst_node FROM edges")
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-
-	var pairs []EdgePair
-	for rows.Next() {
-		var src, dst int64
-		rows.Scan(&src, &dst)
-		pairs = append(pairs, EdgePair{Src: src, Dst: dst})
-	}
-	return pairs, nil
+type AdjStats struct {
+    Gets      int `json:"gets"`
+    Hits      int `json:"hits"`
+    Puts      int `json:"puts"`
+    Evictions int `json:"evictions"`
 }
 
-func fetchNodeIDs(dsn string) ([]int64, error) {
-	db, err := sql.Open("mysql", dsn)
-	if err != nil {
-		return nil, err
-	}
-	defer db.Close()
-
-	rows, err := db.Query("SELECT node_id FROM nodes")
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-
-	var ids []int64
-	for rows.Next() {
-		var id int64
-		rows.Scan(&id)
-		ids = append(ids, id)
-	}
-	return ids, nil
-}
-
-func drainAndClose(resp *http.Response) {
-	if resp == nil {
-		return
-	}
-	// Drain to enable connection reuse even if server uses chunked/non-empty bodies.
-	io.Copy(io.Discard, resp.Body)
-	resp.Body.Close()
-}
-
-func clearCache(server string) {
-	resp, err := httpClient.Get(server + "/debug/clear_cache")
-	if err == nil {
-		drainAndClose(resp)
-	}
-}
-
-func printAdjCacheStats(server string) {
-	resp, err := httpClient.Get(server + "/debug/adjcache_stats")
-	if err != nil {
-		fmt.Println("Failed to fetch stats:", err)
-		return
-	}
-	defer drainAndClose(resp)
-
-	var stats map[string]int
-	_ = json.NewDecoder(resp.Body).Decode(&stats)
-
-	gets := stats["gets"]
-	hits := stats["hits"]
-	puts := stats["puts"]
-
-	hitRate := 0.0
-	if gets > 0 {
-		hitRate = float64(hits) * 100 / float64(gets)
-	}
-
-	fmt.Printf("AdjCache: gets=%d hits=%d puts=%d hit-rate=%.2f%%\n",
-		gets, hits, puts, hitRate)
-}
-
-func runRoute(server string, p EdgePair, out chan<- float64, wg *sync.WaitGroup, sem chan struct{}) {
-	defer wg.Done()
-	defer func() { <-sem }()
-
-	url := fmt.Sprintf("%s/route?src=%d&dst=%d", server, p.Src, p.Dst)
-	start := time.Now()
-	resp, err := httpClient.Get(url)
-	if err == nil {
-		drainAndClose(resp)
-	}
-	ms := float64(time.Since(start).Microseconds()) / 1000.0
-	out <- ms
-}
-
-func runUpdate(server string, edgeID int64, out chan<- float64, wg *sync.WaitGroup, sem chan struct{}) {
-	defer wg.Done()
-	defer func() { <-sem }()
-
-	url := server + "/road/update"
-	body := map[string]any{
-		"edge_id":    edgeID,
-		"speed_kmph": rand.Intn(70) + 20,
-	}
-	b, _ := json.Marshal(body)
-
-	start := time.Now()
-	resp, err := httpClient.Post(url, "application/json", bytes.NewReader(b))
-	if err == nil {
-		drainAndClose(resp)
-	}
-
-	ms := float64(time.Since(start).Microseconds()) / 1000.0
-	out <- ms
-}
-
-func percentile(lat []float64, p float64) float64 {
-	if len(lat) == 0 {
-		return 0
-	}
-	idx := int(float64(len(lat)-1)*p + 0.5)
-	if idx < 0 {
-		idx = 0
-	}
-	if idx >= len(lat) {
-		idx = len(lat) - 1
-	}
-	return lat[idx]
-}
-
-func runWorkload(server string, pairs []EdgePair, mode, csvfile string, ops int, parallel int, cClearEvery int) {
-	switch mode {
-	case "A1":
-		fmt.Println("Clearing cache (A1 Cold CPU)...")
-		clearCache(server)
-	case "C":
-		fmt.Println("🚀 Mode C — CPU OVERLOAD (routes only, no DB writes)")
-		fmt.Println("Clearing cache (C Cold CPU at the start)...")
-		clearCache(server)
-	}
-
-	fmt.Println("Running workload:", mode)
-
-	sem := make(chan struct{}, parallel)
-	out := make(chan float64, ops)
-	var wg sync.WaitGroup
-
-	f, _ := os.Create(csvfile)
-	w := csv.NewWriter(f)
-	// Disable CSV disk writes in Mode C for max generator throughput
-	if mode == "C" {
-		w = csv.NewWriter(io.Discard)
-	}
-	_ = w.Write([]string{"op_index", "latency_ms"})
-
-	for i := 0; i < ops; i++ {
-		if mode == "C" && cClearEvery > 0 && i > 0 && (i%cClearEvery == 0) {
-			clearCache(server)
-		}
-
-		wg.Add(1)
-		sem <- struct{}{}
-
-		if mode == "B" {
-			go runUpdate(server, int64(i%len(pairs)), out, &wg, sem)
-		} else {
-			idx := rand.Intn(len(pairs))
-			go runRoute(server, pairs[idx], out, &wg, sem)
-		}
-	}
-
-	wg.Wait()
-	close(out)
-
-	var lat []float64
-	j := 0
-	for ms := range out {
-		lat = append(lat, ms)
-		_ = w.Write([]string{fmt.Sprintf("%d", j), fmt.Sprintf("%.3f", ms)})
-		j++
-	}
-
-	w.Flush()
-	f.Close()
-
-	sort.Float64s(lat)
-	avg := 0.0
-	for _, x := range lat {
-		avg += x
-	}
-	if len(lat) > 0 {
-		avg /= float64(len(lat))
-	}
-
-	p50 := percentile(lat, 0.50)
-	p95 := percentile(lat, 0.95)
-	p99 := percentile(lat, 0.99)
-
-	fmt.Printf("[%s] %d ops parallel=%d — avg=%.2fms p50=%.2fms p95=%.2fms p99=%.2fms\n",
-		mode, ops, parallel, avg, p50, p95, p99)
-
-	printAdjCacheStats(server)
-}
 
 func main() {
-	// ===== FLAGS =====
-	var (
-		dsn         = flag.String("dsn", "root:admin@tcp(127.0.0.1:3306)/routing", "MySQL DSN")
-		server      = flag.String("server", "http://127.0.0.1:8080", "Server base URL")
-		ops         = flag.Int("ops", 5000, "Operations per mode")
-		parallel    = flag.Int("parallel", 200, "Max in-flight requests")
-		pairset     = flag.Int("pairset", 200, "Subset of routes to use")
-		cooldown    = flag.Duration("cooldown", 2*time.Second, "Cooldown between workloads")
-		pairmode    = flag.String("pairmode", "edge", "pair selection mode: edge | random")
-		modeC       = flag.Bool("modeC", false, "CPU overload mode (flatline server core), runs alone")
-		cClearEvery = flag.Int("c_clear_every", 0, "Mode C: clear caches every N ops (0 = never)")
-	)
-	flag.Parse()
-
-	// shared HTTP client with a large keep-alive pool
-	httpClient = &http.Client{
-		Transport: &http.Transport{
-			MaxIdleConns:        10000,
-			MaxIdleConnsPerHost: 10000,
-			IdleConnTimeout:     90 * time.Second,
-			DisableCompression:  true,
-			// keep-alive is ON by default; so i have not set DisableKeepAlives=true
-		},
-		Timeout: 0, // no client-side timeout: let the server be the limiter
+	if len(os.Args) < 3 {
+		log.Fatalf("usage: loadgen <mysql_dsn> <server_addr>")
 	}
 
-	// ===== Load Data =====
-	fmt.Println("Loading data...")
+	dsn := os.Args[1]
+	server := os.Args[2]
+	duration := 30 * time.Second
 
-	var pairs []EdgePair
+	db, err := sql.Open("mysql", dsn)
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer db.Close()
 
-	if *pairmode == "edge" {
-		fmt.Println("Mode: Using EDGE pairs (valid guaranteed src/dst)")
-		allPairs, err := fetchEdgePairs(*dsn)
+	nodes, err := loadNodes(db)
+	if err != nil {
+		log.Fatal(err)
+	}
+	log.Printf("Loaded %d nodes", len(nodes))
+
+	// Stats for route cache
+	var totalReq int64 = 0
+	var totalErr int64 = 0
+	var totalHit int64 = 0
+
+	// Latency records
+	var latencies []time.Duration
+
+	client := &http.Client{Timeout: 10 * time.Second}
+
+	
+	// clear cache before test to avoid cumulative stats
+	_, err = client.Get(server + "/debug/clear_cache")
+	if err != nil {
+		log.Fatalf("failed to clear cache: %v", err)
+	}
+	log.Println("Cache cleared")
+
+	rnd := rand.New(rand.NewSource(time.Now().UnixNano()))
+
+	log.Println("Running loadgen for 30 seconds…")
+
+	ctx, cancel := context.WithTimeout(context.Background(), duration)
+	defer cancel()
+
+	for {
+		select {
+		case <-ctx.Done():
+			goto FINISH
+		default:
+		}
+
+		src := nodes[rnd.Intn(len(nodes))]
+		dst := nodes[rnd.Intn(len(nodes))]
+
+		start := time.Now()
+		resp, err := client.Get(fmt.Sprintf("%s/route?src=%d&dst=%d", server, src, dst))
+		lat := time.Since(start)
+
+		totalReq++
+		latencies = append(latencies, lat)
+
 		if err != nil {
-			panic(err)
+			totalErr++
+			continue
 		}
-		rand.Shuffle(len(allPairs), func(i, j int) { allPairs[i], allPairs[j] = allPairs[j], allPairs[i] })
-		if *pairset > 0 && *pairset < len(allPairs) {
-			allPairs = allPairs[:*pairset]
-		}
-		pairs = allPairs
-	} else {
-		fmt.Println("Mode: Using RANDOM node pairs")
-		nodeIDs, err := fetchNodeIDs(*dsn)
-		if err != nil {
-			panic(err)
-		}
-		if *pairset <= 0 {
-			*pairset = 200
-		}
-		for i := 0; i < *pairset; i++ {
-			src := nodeIDs[rand.Intn(len(nodeIDs))]
-			dst := nodeIDs[rand.Intn(len(nodeIDs))]
-			pairs = append(pairs, EdgePair{Src: src, Dst: dst})
+
+		var rr RouteResp
+		json.NewDecoder(resp.Body).Decode(&rr)
+		resp.Body.Close()
+
+		if rr.CacheHit {
+			totalHit++
 		}
 	}
 
-	fmt.Printf("Using %d pairs for loadgen\n", len(pairs))
+FINISH:
 
-	// ===== Pinning Pause =====
-	fmt.Println("✅ Loadgen ready.")
-	fmt.Println("👉 PIN CORES NOW:")
-	fmt.Println("   - graphion.exe → YOUR target core")
-	fmt.Println("   - loadgen.exe  → some other core(s)")
-	fmt.Println("👉 Press ENTER to start...")
-	fmt.Scanln()
-
-	// ===== Workloads =====
-	if *modeC {
-		// Mode C runs ALONE
-		runWorkload(*server, pairs, "C", "C_cpu_overload.csv", *ops, *parallel, *cClearEvery)
-		return
+	// ---- fetch adjacency cache stats ----
+	adj := AdjStats{}
+	resp, err := client.Get(server + "/debug/adjcache_stats")
+	if err == nil {
+		json.NewDecoder(resp.Body).Decode(&adj)
+		resp.Body.Close()
 	}
 
-	runWorkload(*server, pairs, "A1", "A1_cold.csv", *ops, *parallel, 0)
-	time.Sleep(*cooldown)
+	fmt.Println("\n========== LOADGEN SUMMARY ==========")
+	fmt.Printf("Total Requests: %d\n", totalReq)
+	fmt.Printf("Errors: %d\n", totalErr)
 
-	runWorkload(*server, pairs, "A2", "A2_warm.csv", *ops, *parallel, 0)
-	time.Sleep(*cooldown)
+	// route cache % 
+	routeHitRate := float64(totalHit) / float64(totalReq) * 100
+	fmt.Printf("RouteCache Hit Rate: %.1f%%\n", routeHitRate)
 
-	runWorkload(*server, pairs, "B", "B_io.csv", *ops, *parallel, 0)
+	fmt.Printf("Evictions: %d\n", adj.Evictions)
+
+
+	// adjacency cache %
+	if adj.Gets > 0 {
+		adjHitRate := float64(adj.Hits) / float64(adj.Gets) * 100
+		fmt.Printf("AdjCache Hit Rate: %.1f%% (gets=%d, hits=%d, puts=%d)\n",
+			adjHitRate, adj.Gets, adj.Hits, adj.Puts)
+	}
+
+	if len(latencies) > 0 {
+		var min, max, sum time.Duration
+		min = latencies[0]
+		max = latencies[0]
+		for _, l := range latencies {
+			if l < min {
+				min = l
+			}
+			if l > max {
+				max = l
+			}
+			sum += l
+		}
+		avg := sum / time.Duration(len(latencies))
+
+		fmt.Printf("Avg Latency: %v\n", avg)
+		fmt.Printf("Fastest: %v\n", min)
+		fmt.Printf("Slowest: %v\n", max)
+	}
+
+	fmt.Println("=====================================")
+}
+
+func loadNodes(db *sql.DB) ([]int64, error) {
+	rows, err := db.Query(`
+		SELECT DISTINCT src_node FROM edges
+		UNION
+		SELECT DISTINCT dst_node FROM edges
+	`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	nodes := []int64{}
+	for rows.Next() {
+		var id int64
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		nodes = append(nodes, id)
+	}
+	return nodes, nil
 }
