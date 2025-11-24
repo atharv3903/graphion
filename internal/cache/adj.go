@@ -6,9 +6,6 @@ import (
 
 	"github.com/atharv3903/graphion/internal/model"
 )
-
-// defaultAdjCapacity is the default number of adjacency entries the cache will hold.
-// Change as needed or use NewAdjCacheWithCap for a custom size.
 const defaultAdjCapacity = 2048
 
 type adjEntry struct {
@@ -16,8 +13,6 @@ type adjEntry struct {
 	val []model.Edge
 }
 
-// AdjCache is a bounded LRU cache for adjacency lists.
-// It's safe for concurrent use.
 type AdjCache struct {
 	mu        sync.Mutex
 	m         map[int64]*list.Element
@@ -30,13 +25,10 @@ type AdjCache struct {
 	evictions int
 }
 
-// NewAdjCache returns an LRU adj cache with the default capacity.
 func NewAdjCache() *AdjCache {
 	return NewAdjCacheWithCap(defaultAdjCapacity)
 }
 
-// NewAdjCacheWithCap returns an LRU adj cache with the provided capacity.
-// capacity must be > 0.
 func NewAdjCacheWithCap(capacity int) *AdjCache {
 	if capacity <= 0 {
 		capacity = defaultAdjCapacity
@@ -48,8 +40,7 @@ func NewAdjCacheWithCap(capacity int) *AdjCache {
 	}
 }
 
-// Get returns the adjacency list for key, and true if it was found.
-// It updates LRU position on hit.
+
 func (c *AdjCache) Get(key int64) ([]model.Edge, bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -63,8 +54,6 @@ func (c *AdjCache) Get(key int64) ([]model.Edge, bool) {
 	return nil, false
 }
 
-// Put inserts the adjacency list into the cache. If insertion causes the cache to exceed
-// capacity, the least-recently-used entry is evicted.
 func (c *AdjCache) Put(key int64, v []model.Edge) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
